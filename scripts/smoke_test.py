@@ -12,12 +12,18 @@ from unittest.mock import patch
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain.tools import ToolRuntime, tool
+from langchain_core.language_models.fake_chat_models import (
+    FakeListChatModel,
+    GenericFakeChatModel,
+)
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
 from langchain_scaledown import (
     ScaledownClient,
     ScaledownCompressionMiddleware,
+    ScaledownExtractionMiddleware,
     ScaledownSummarizationMiddleware,
 )
 
@@ -106,8 +112,116 @@ def run_compression(use_async: bool) -> None:
     assert system.text == "launch code: 7-4-1"
 
 
+class ToolCallingFake(GenericFakeChatModel):
+    """GenericFakeChatModel that accepts bind_tools, so it can emit tool calls."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+TICKET_ENTITIES = {
+    "order_id": "Order number the customer mentions",
+    "error_message": "Exact error message or code the customer saw",
+    "customer_email": "Customer's email address",
+    "issue_type": {"labels": ["billing", "technical", "account"]},
+    "sentiment": {"labels": ["frustrated", "neutral", "satisfied"]},
+}
+
+
+def extract_response(text, entities, **kwargs):
+    """Fake /extract: returns only spans that are actually present in `text`."""
+    found = [
+        ("A-1042", "order_id"),
+        ("ERR_PAYMENT_DECLINED", "error_message"),
+        ("jane@example.com", "customer_email"),
+    ]
+    spans = [
+        {"text": value, "type": key, "confidence": 0.95}
+        for value, key in found
+        if value in text
+    ]
+    spans += [
+        {"text": "billing", "type": "issue_type", "confidence": 0.93},
+        {"text": "frustrated", "type": "sentiment", "confidence": 0.9},
+    ]
+    return {"entities": spans, "structured_result": None, "ocr_text": None}
+
+
+def run_extraction(use_async: bool) -> None:
+    filed = []
+
+    @tool
+    def file_ticket(runtime: ToolRuntime) -> str:
+        """File a support ticket from the fields extracted so far."""
+        fields = runtime.state["scaledown_extraction"]["fields"]
+        filed.append(dict(fields))
+        return f"Filed ticket #{len(filed)}"
+
+    spy = Spy()
+    model = ToolCallingFake(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "file_ticket", "args": {}, "id": "c1"}],
+                ),
+                AIMessage(content="Filed. What's your email?"),
+                AIMessage(content="Thanks, updated."),
+            ]
+        )
+    )
+    agent = create_agent(
+        model=model,
+        tools=[file_ticket],
+        system_prompt="You are a support agent.",
+        middleware=[
+            ScaledownExtractionMiddleware(TICKET_ENTITIES, inject_into_prompt=True),
+            spy,
+        ],
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "t1"}}
+    turns = [
+        "Order A-1042 failed with ERR_PAYMENT_DECLINED. Third time, I'm fed up.",
+        "It's jane@example.com",
+    ]
+    with patch.object(
+        ScaledownClient, "extract", side_effect=extract_response
+    ) as extract:
+        results = []
+        for turn in turns:
+            inputs = {"messages": [HumanMessage(turn)]}
+            results.append(
+                asyncio.run(agent.ainvoke(inputs, config))
+                if use_async
+                else agent.invoke(inputs, config)
+            )
+
+    first, second = (r["scaledown_extraction"]["fields"] for r in results)
+    print(f"[extraction {'async' if use_async else 'sync'}]")
+    print(f"  sd_extract called: {extract.call_count}x (once per turn)")
+    print(f"  turn 1 fields: {first}")
+    print(f"  turn 2 fields: {second}")
+    print(f"  file_ticket tool read from state: {filed[0]}")
+    injected = spy.seen[0].system_message.text
+    print("  model saw system prompt:")
+    for line in injected.splitlines():
+        print(f"    {line}")
+    assert extract.call_count == 2
+    # Turn 2 re-extracts over the whole conversation, human messages only.
+    assert turns[0] in extract.call_args.args[0]
+    assert "What's your email" not in extract.call_args.args[0]
+    assert first["customer_email"] is None
+    assert second["customer_email"] == "jane@example.com"
+    assert second["order_id"] == "A-1042"
+    assert filed[0]["issue_type"] == "billing"
+    assert injected.startswith("You are a support agent.")
+    assert '- order_id: "A-1042"' in injected
+
+
 if __name__ == "__main__":
     for use_async in (False, True):
         run_summarization(use_async)
         run_compression(use_async)
+        run_extraction(use_async)
     print("\nSMOKE TEST PASSED")

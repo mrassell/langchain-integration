@@ -3,6 +3,7 @@ from importlib import metadata
 from langchain_scaledown._client import ScaledownAPIError, ScaledownClient
 from langchain_scaledown.middleware import (
     ScaledownCompressionMiddleware,
+    ScaledownExtractionMiddleware,
     ScaledownSummarizationMiddleware,
 )
 
@@ -17,6 +18,7 @@ __all__ = [
     "ScaledownAPIError",
     "ScaledownClient",
     "ScaledownCompressionMiddleware",
+    "ScaledownExtractionMiddleware",
     "ScaledownSummarizationMiddleware",
     "__version__",
 ]

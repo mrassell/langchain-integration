@@ -1,11 +1,12 @@
 # langchain-scaledown
 
 ScaleDown middleware for LangChain agents. `langchain-scaledown` plugs
-[ScaleDown](https://scaledown.ai)'s context-reduction API into
+[ScaleDown](https://scaledown.ai)'s task-specific models into
 `langchain.agents.create_agent()` as agent middleware: one class summarizes long
-conversation history, the other compresses large retrieved context relative to
-the user's question. Both fail open: if ScaleDown is unavailable, the model is
-called with the original request.
+conversation history, one compresses large retrieved context relative to the
+user's question, and one extracts structured fields (like a support ticket)
+from the conversation as it happens. All three fail open: if ScaleDown is
+unavailable, the agent runs as if the middleware weren't there.
 
 ## Installation
 
@@ -99,11 +100,91 @@ def extract(request):
 ScaledownCompressionMiddleware(context_extractor=extract, rate="auto")
 ```
 
+## `ScaledownExtractionMiddleware`
+
+Turns a conversation into a structured record as it happens. Once per agent
+invocation, before the model runs, the user's messages are sent to ScaleDown's
+`/extract` endpoint with your schema. The result lands in agent state, so your
+tools can read it mid-run and you get it back from `agent.invoke()`.
+
+Two kinds of fields go in one schema, and ScaleDown handles both in a single call:
+
+- **Extractive fields** (a description string): the value is copied verbatim
+  from what the user said, such as an order number, an error message, or an email.
+- **Classification keys** (an object with `labels`): ScaleDown routes these to
+  its classification model, which picks one of your labels. Use them for
+  decisions such as sentiment or issue type, where there's nothing to copy.
+
+By default only the user's messages are extracted from, never the agent's own
+replies, so every extractive value is something the customer actually said.
+
+```python
+from langchain.agents import create_agent
+from langchain.tools import ToolRuntime, tool
+from langchain_scaledown import ScaledownExtractionMiddleware
+
+ticket = ScaledownExtractionMiddleware(
+    entities={
+        # Extractive: quoted from the customer's messages
+        "order_id": "Order number the customer mentions",
+        "error_message": "Exact error message or code the customer saw",
+        "steps_tried": "What the customer says they already tried",
+        "customer_email": "Customer's email address",
+        # Classification keys: routed to ScaleDown's classify model
+        "issue_type": {
+            "labels": [
+                {"name": "billing", "rubric": "Is this about a charge, refund, or payment?"},
+                {"name": "technical", "rubric": "Is this about a bug or something not working?"},
+                {"name": "account", "rubric": "Is this about login, password, or account settings?"},
+            ]
+        },
+        "sentiment": {"labels": ["frustrated", "neutral", "satisfied"]},
+    },
+    context_chars=0,          # skip evidence context to keep state small
+    inject_into_prompt=True,  # let the agent see the fields (see note below)
+)
+
+
+@tool
+def file_ticket(runtime: ToolRuntime) -> str:
+    """File a support ticket with the details gathered so far."""
+    # .get(): the key is absent if extraction hasn't succeeded yet
+    fields = runtime.state.get("scaledown_extraction", {}).get("fields", {})
+    return crm.create_ticket(**fields)  # your ticketing system
+
+
+agent = create_agent("openai:gpt-4.1", tools=[file_ticket], middleware=[ticket])
+
+result = agent.invoke({"messages": [{"role": "user", "content": "Order A-1042 failed ..."}]})
+result["scaledown_extraction"]["fields"]
+# {"order_id": "A-1042", "error_message": "ERR_PAYMENT_DECLINED", "steps_tried": None,
+#  "customer_email": None, "issue_type": "billing", "sentiment": "frustrated"}
+```
+
+`fields` has one entry per key in your schema: the highest-confidence value, or
+`None` if nothing was found. `entities` holds ScaleDown's raw matches with
+confidence scores. Nested and array schemas work too; their values come from
+ScaleDown's `structured_result`.
+
+With a checkpointer, extraction re-runs every turn over the whole conversation,
+so the record fills in as the customer adds detail (turn 1 has the order number;
+turn 2 adds their email).
+
+> **About `inject_into_prompt`** (off by default): it appends the extracted fields
+> to the system message so the agent can act on them, for example escalating a
+> frustrated customer. Extractive values are customer text, so enabling this puts
+> customer text into the system prompt. Only turn it on when that's acceptable,
+> and have the agent branch on classification keys, whose values can only be
+> one of your labels.
+
+Pass `text_builder=` to extract from something other than the user's messages.
+
 ## Development
 
 ```bash
 poetry install --with test,lint
 make test                             # unit tests
 make lint
-poetry run python scripts/smoke_test.py   # runs both middlewares in a real agent (mocked API)
+poetry run python scripts/smoke_test.py   # runs every middleware in a real agent (mocked API)
+SCALEDOWN_API_KEY=... poetry run python scripts/live_check.py   # checks the live endpoints
 ```

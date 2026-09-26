@@ -6,6 +6,7 @@ Endpoint shapes follow https://docs.scaledown.ai/api-reference/.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import requests
@@ -86,6 +87,35 @@ class ScaledownClient:
             raise ScaledownAPIError(
                 "ScaleDown summarization response missing 'summary'"
             ) from e
+
+    def extract(
+        self,
+        text: str,
+        entities: Mapping[str, Any],
+        instruction: str | None = None,
+        threshold: float | None = None,
+        top_n: int | None = None,
+        context_chars: int | None = None,
+    ) -> dict[str, Any]:
+        """Extract entities from `text` using a custom schema.
+
+        `entities` maps each field name to a description string, an object
+        (`description` / `threshold` / `top_n`), a nested schema, or a
+        classification key (an object with a `labels` list, which ScaleDown
+        routes to its classification model).
+
+        Returns the full response dict (`entities`, `structured_result`, ...).
+        Optional parameters left as `None` are omitted, so the API defaults apply.
+        """
+        body: dict[str, Any] = {"text": text, "entities": dict(entities)}
+        optional = {
+            "instruction": instruction,
+            "threshold": threshold,
+            "top_n": top_n,
+            "context_chars": context_chars,
+        }
+        body.update({k: v for k, v in optional.items() if v is not None})
+        return self._post("/extract", body)
 
     def compress(self, context: str, prompt: str, rate: Any = "auto") -> dict[str, Any]:
         """Compress `context` relative to `prompt`.
