@@ -14,9 +14,11 @@ from langchain_core.messages import (
     AIMessage,
     AnyMessage,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from langchain_scaledown import (
     ScaledownAPIError,
@@ -68,21 +70,35 @@ def conversation(n: int) -> list[AnyMessage]:
 # --------------------------------------------------------------------------
 
 
+def run_before_model(
+    mw: ScaledownSummarizationMiddleware, messages: list[AnyMessage]
+) -> dict[str, Any] | None:
+    return mw.before_model({"messages": messages}, MagicMock())
+
+
+def kept_after_summary(update: dict[str, Any]) -> list[AnyMessage]:
+    """Messages in a summarization update, after RemoveMessage + summary."""
+    remove, summary, *kept = update["messages"]
+    assert isinstance(remove, RemoveMessage)
+    assert remove.id == REMOVE_ALL_MESSAGES
+    assert isinstance(summary, HumanMessage)
+    assert summary.additional_kwargs == {"lc_source": "summarization"}
+    return kept
+
+
 class TestSummarization:
     def test_below_trigger_passes_through(self, client: ScaledownClient) -> None:
         mw = ScaledownSummarizationMiddleware(
             trigger=("messages", 10), keep=("messages", 2), client=client
         )
-        request = make_request(conversation(5))
-        handler = MagicMock(return_value="response")
         with patch.object(ScaledownClient, "summarize") as summarize:
-            result = mw.wrap_model_call(request, handler)
+            update = run_before_model(mw, conversation(5))
         summarize.assert_not_called()
-        request.override.assert_not_called()
-        handler.assert_called_once_with(request)
-        assert result == "response"
+        assert update is None
 
-    def test_message_trigger_summarizes(self, client: ScaledownClient) -> None:
+    def test_message_trigger_summarizes_into_state(
+        self, client: ScaledownClient
+    ) -> None:
         mw = ScaledownSummarizationMiddleware(
             trigger=("messages", 6),
             keep=("messages", 2),
@@ -91,12 +107,10 @@ class TestSummarization:
             client=client,
         )
         messages = conversation(6)
-        request = make_request(messages)
-        handler = MagicMock(return_value="response")
         with patch.object(
             ScaledownClient, "summarize", return_value="the summary"
         ) as summarize:
-            mw.wrap_model_call(request, handler)
+            update = run_before_model(mw, messages)
 
         summarize.assert_called_once()
         transcript = summarize.call_args.args[0]
@@ -107,20 +121,14 @@ class TestSummarization:
             "max_tokens": 100,
         }
 
-        request.override.assert_called_once()
-        new_messages = request.override.call_args.kwargs["messages"]
-        assert len(new_messages) == 3
-        assert isinstance(new_messages[0], SystemMessage)
-        assert "the summary" in new_messages[0].text
+        assert update is not None
+        assert "the summary" in update["messages"][1].text
         # Kept messages are the same objects, untouched.
-        assert new_messages[1] is messages[4]
-        assert new_messages[2] is messages[5]
-
-        sent = handler.call_args.args[0]
-        assert sent is not request
-        assert sent.messages == new_messages
-        # Original request not mutated.
-        assert request.messages is messages
+        kept = kept_after_summary(update)
+        assert kept[0] is messages[4]
+        assert kept[1] is messages[5]
+        # Every message has an id, so the add_messages reducer can apply this.
+        assert all(m.id for m in messages)
 
     def test_token_trigger_uses_custom_counter(self, client: ScaledownClient) -> None:
         counter = MagicMock(return_value=10_000)
@@ -130,13 +138,53 @@ class TestSummarization:
             token_counter=counter,
             client=client,
         )
-        request = make_request(conversation(3))
-        handler = MagicMock()
+        messages = conversation(3)
         with patch.object(ScaledownClient, "summarize", return_value="s") as summ:
-            mw.wrap_model_call(request, handler)
-        counter.assert_called_once_with(request.messages)
+            update = run_before_model(mw, messages)
+        counter.assert_called_once_with(messages)
         summ.assert_called_once()
-        assert len(handler.call_args.args[0].messages) == 2
+        assert update is not None
+        assert len(kept_after_summary(update)) == 1
+
+    def test_any_trigger_in_list_fires(self, client: ScaledownClient) -> None:
+        mw = ScaledownSummarizationMiddleware(
+            trigger=[("tokens", 1_000_000), ("messages", 4)],
+            keep=("messages", 1),
+            client=client,
+        )
+        with patch.object(ScaledownClient, "summarize", return_value="s") as summ:
+            update = run_before_model(mw, conversation(4))
+        summ.assert_called_once()
+        assert update is not None
+
+    def test_token_keep(self, client: ScaledownClient) -> None:
+        # Each message counts as 10 tokens; keeping 25 tokens keeps 2 messages.
+        mw = ScaledownSummarizationMiddleware(
+            trigger=("messages", 4),
+            keep=("tokens", 25),
+            token_counter=lambda msgs: 10 * len(list(msgs)),
+            client=client,
+        )
+        messages = conversation(5)
+        with patch.object(ScaledownClient, "summarize", return_value="s"):
+            update = run_before_model(mw, messages)
+        assert update is not None
+        assert kept_after_summary(update) == messages[3:]
+
+    def test_token_keep_always_keeps_latest_message(
+        self, client: ScaledownClient
+    ) -> None:
+        mw = ScaledownSummarizationMiddleware(
+            trigger=("messages", 3),
+            keep=("tokens", 5),
+            token_counter=lambda msgs: 10 * len(list(msgs)),
+            client=client,
+        )
+        messages = conversation(3)
+        with patch.object(ScaledownClient, "summarize", return_value="s"):
+            update = run_before_model(mw, messages)
+        assert update is not None
+        assert kept_after_summary(update) == messages[-1:]
 
     def test_default_token_counter_below_threshold(
         self, client: ScaledownClient
@@ -144,12 +192,10 @@ class TestSummarization:
         mw = ScaledownSummarizationMiddleware(
             trigger=("tokens", 10_000), keep=("messages", 1), client=client
         )
-        request = make_request(conversation(4))
-        handler = MagicMock()
         with patch.object(ScaledownClient, "summarize") as summarize:
-            mw.wrap_model_call(request, handler)
+            update = run_before_model(mw, conversation(4))
         summarize.assert_not_called()
-        handler.assert_called_once_with(request)
+        assert update is None
 
     def test_does_not_orphan_tool_messages(self, client: ScaledownClient) -> None:
         mw = ScaledownSummarizationMiddleware(
@@ -159,46 +205,48 @@ class TestSummarization:
             content="", tool_calls=[{"name": "t", "args": {}, "id": "call_1"}]
         )
         tool = ToolMessage(content="result", tool_call_id="call_1")
-        request = make_request([HumanMessage(content="q"), ai, tool])
-        handler = MagicMock()
         with patch.object(ScaledownClient, "summarize", return_value="s"):
-            mw.wrap_model_call(request, handler)
-        new_messages = handler.call_args.args[0].messages
-        assert new_messages[1:] == [ai, tool]
+            update = run_before_model(mw, [HumanMessage(content="q"), ai, tool])
+        assert update is not None
+        assert kept_after_summary(update) == [ai, tool]
 
     def test_api_error_fails_open(self, client: ScaledownClient) -> None:
         mw = ScaledownSummarizationMiddleware(
             trigger=("messages", 2), keep=("messages", 1), client=client
         )
-        request = make_request(conversation(4))
-        handler = MagicMock(return_value="response")
         with patch.object(
             ScaledownClient, "summarize", side_effect=ScaledownAPIError("boom")
         ):
-            result = mw.wrap_model_call(request, handler)
-        request.override.assert_not_called()
-        handler.assert_called_once_with(request)
-        assert result == "response"
+            update = run_before_model(mw, conversation(4))
+        assert update is None
 
     async def test_async_summarizes(self, client: ScaledownClient) -> None:
         mw = ScaledownSummarizationMiddleware(
             trigger=("messages", 4), keep=("messages", 1), client=client
         )
-        request = make_request(conversation(4))
-
-        async def handler(req: Any) -> Any:
-            return req
-
         with patch.object(ScaledownClient, "summarize", return_value="s") as summ:
-            sent = await mw.awrap_model_call(request, handler)
+            update = await mw.abefore_model({"messages": conversation(4)}, MagicMock())
         summ.assert_called_once()
-        assert len(sent.messages) == 2
+        assert update is not None
+        assert len(kept_after_summary(update)) == 1
+
+    async def test_async_api_error_fails_open(self, client: ScaledownClient) -> None:
+        mw = ScaledownSummarizationMiddleware(
+            trigger=("messages", 2), keep=("messages", 1), client=client
+        )
+        with patch.object(
+            ScaledownClient, "summarize", side_effect=ScaledownAPIError("boom")
+        ):
+            update = await mw.abefore_model({"messages": conversation(4)}, MagicMock())
+        assert update is None
 
     def test_invalid_config(self, client: ScaledownClient) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="model profile"):
             ScaledownSummarizationMiddleware(trigger=("fraction", 1), client=client)  # type: ignore[arg-type]
         with pytest.raises(ValueError):
-            ScaledownSummarizationMiddleware(keep=("tokens", 5), client=client)  # type: ignore[arg-type]
+            ScaledownSummarizationMiddleware(keep=("messages", -1), client=client)
+        with pytest.raises(ValueError):
+            ScaledownSummarizationMiddleware(trigger=[], client=client)
 
 
 # --------------------------------------------------------------------------

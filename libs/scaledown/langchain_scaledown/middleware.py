@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
@@ -18,11 +19,13 @@ from langchain.agents.middleware.types import OmitFromInput
 from langchain_core.messages import (
     AnyMessage,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
     get_buffer_string,
 )
 from langchain_core.messages.utils import count_tokens_approximately
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import NotRequired
 
 from langchain_scaledown._client import ScaledownAPIError, ScaledownClient
@@ -34,10 +37,9 @@ logger = logging.getLogger(__name__)
 
 TokenCounter = Callable[[Iterable[AnyMessage]], int]
 ContextExtractor = Callable[[ModelRequest], "tuple[str, str] | None"]
-Trigger = tuple[Literal["tokens", "messages"], int]
-Keep = tuple[Literal["messages"], int]
+ContextSize = tuple[Literal["tokens", "messages"], int]
 
-_SUMMARY_PREFIX = "Summary of the earlier conversation:\n\n"
+_SUMMARY_PREFIX = "Here is a summary of the conversation to date:\n\n"
 
 
 def _resolve_client(
@@ -48,29 +50,52 @@ def _resolve_client(
     return ScaledownClient(api_key=api_key, base_url=base_url)
 
 
+def _validate_context_size(value: Any, name: str) -> ContextSize:
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 2
+        or value[0] not in ("tokens", "messages")
+        or not isinstance(value[1], int)
+        or value[1] < 0
+    ):
+        hint = ""
+        if isinstance(value, tuple) and value and value[0] == "fraction":
+            hint = " Fractions need a model profile; use ('tokens', N) instead."
+        raise ValueError(
+            f"{name} must be ('tokens', N) or ('messages', N) with N >= 0, "
+            f"got {value!r}.{hint}"
+        )
+    return value
+
+
 class ScaledownSummarizationMiddleware(AgentMiddleware):
     """Summarize older conversation history with ScaleDown's `sd_summarize`.
 
-    Interface-compatible with
-    `langchain.agents.middleware.SummarizationMiddleware`: once the conversation
-    crosses `trigger`, every message except the most recent `keep` messages is
-    sent to ScaleDown's abstractive summarization endpoint and replaced with a
-    single `SystemMessage` holding the summary. The kept messages are passed
-    through untouched.
+    A drop-in alternative to LangChain's built-in `SummarizationMiddleware`: the
+    same `trigger` / `keep` options and the same behavior, but the summary comes
+    from ScaleDown instead of a second LLM call, so no summarization model is
+    needed.
 
-    The rewrite is applied to the model request only (via
-    `ModelRequest.override`); the agent's stored state keeps the full history.
+    Before each model call, if the conversation has crossed `trigger`, every
+    message except the most recent ones selected by `keep` is sent to ScaleDown
+    and replaced in agent state by a single summary message. Like the built-in,
+    the summary is written to state, so each stretch of history is summarized
+    once and the conversation continues from the summary. The kept messages are
+    left untouched, and tool results are never separated from the AI message
+    that requested them.
 
-    If the ScaleDown call fails, the middleware fails open and the model is
-    called with the original, unsummarized request.
+    If the ScaleDown call fails, the middleware fails open: history is left as
+    is and the model is called normally.
 
     Note:
         `sd_summarize` is in private preview. Contact ScaleDown to enable it on
         your account.
 
     Args:
-        trigger: When to summarize: `("tokens", N)` or `("messages", N)`.
-        keep: How many recent messages to keep verbatim: `("messages", N)`.
+        trigger: When to summarize: `("tokens", N)`, `("messages", N)`, or a list
+            of these (summarize when any is met).
+        keep: How much recent history to keep verbatim: `("messages", N)` or
+            `("tokens", N)`.
         token_counter: Callable counting tokens in a list of messages. Defaults
             to LangChain's character-based `count_tokens_approximately`.
         instructions: Optional instructions forwarded to ScaleDown.
@@ -100,8 +125,8 @@ class ScaledownSummarizationMiddleware(AgentMiddleware):
     def __init__(
         self,
         *,
-        trigger: Trigger = ("tokens", 4000),
-        keep: Keep = ("messages", 20),
+        trigger: ContextSize | list[ContextSize] = ("tokens", 4000),
+        keep: ContextSize = ("messages", 20),
         token_counter: TokenCounter = count_tokens_approximately,
         instructions: str | None = None,
         max_tokens: int = 2048,
@@ -110,100 +135,117 @@ class ScaledownSummarizationMiddleware(AgentMiddleware):
         base_url: str | None = None,
     ) -> None:
         super().__init__()
-        kind, value = trigger
-        if kind not in ("tokens", "messages") or value <= 0:
-            raise ValueError(
-                f"trigger must be ('tokens', N) or ('messages', N) with N > 0, "
-                f"got {trigger!r}"
-            )
-        keep_kind, keep_value = keep
-        if keep_kind != "messages" or keep_value < 0:
-            raise ValueError(f"keep must be ('messages', N) with N >= 0, got {keep!r}")
+        triggers = trigger if isinstance(trigger, list) else [trigger]
+        if not triggers:
+            raise ValueError("trigger must not be empty")
         self.trigger = trigger
-        self.keep = keep
+        self._triggers = [_validate_context_size(t, "trigger") for t in triggers]
+        self.keep = _validate_context_size(keep, "keep")
         self.token_counter = token_counter
         self.instructions = instructions
         self.max_tokens = max_tokens
         self.client = _resolve_client(client, api_key, base_url)
 
     def _should_summarize(self, messages: list[AnyMessage]) -> bool:
-        kind, threshold = self.trigger
-        if kind == "messages":
-            return len(messages) >= threshold
-        return self.token_counter(messages) >= threshold
+        tokens: int | None = None
+        for kind, threshold in self._triggers:
+            if kind == "messages" and len(messages) >= threshold:
+                return True
+            if kind == "tokens":
+                if tokens is None:
+                    tokens = self.token_counter(messages)
+                if tokens >= threshold:
+                    return True
+        return False
 
-    def _split(
-        self, messages: list[AnyMessage]
-    ) -> tuple[list[AnyMessage], list[AnyMessage]] | None:
-        """Split into (to_summarize, to_keep), or None if nothing to summarize."""
-        cutoff = max(len(messages) - self.keep[1], 0)
+    def _cutoff(self, messages: list[AnyMessage]) -> int:
+        """Index splitting messages into (to summarize, to keep)."""
+        kind, amount = self.keep
+        if kind == "messages":
+            cutoff = max(len(messages) - amount, 0)
+        else:
+            cutoff, kept = len(messages), 0
+            while cutoff > 0:
+                size = self.token_counter([messages[cutoff - 1]])
+                if kept + size > amount:
+                    break
+                kept += size
+                cutoff -= 1
+            # Always keep the latest message, even if it alone exceeds the budget.
+            cutoff = min(cutoff, len(messages) - 1)
         # Don't let the kept tail start with tool results whose requesting
-        # AIMessage was summarized away; pull the cutoff back to include it.
+        # AIMessage would be summarized away; pull the cutoff back to include it.
         while 0 < cutoff < len(messages) and isinstance(messages[cutoff], ToolMessage):
             cutoff -= 1
-        if cutoff == 0:
+        return cutoff
+
+    def _prepare(self, state: AgentState[Any]) -> tuple[str, list[AnyMessage]] | None:
+        """Return (transcript to summarize, messages to keep), or None to skip."""
+        messages = state["messages"]
+        if not self._should_summarize(messages):
             return None
-        return messages[:cutoff], messages[cutoff:]
+        cutoff = self._cutoff(messages)
+        if cutoff <= 0:
+            return None
+        for message in messages:
+            if message.id is None:
+                message.id = str(uuid.uuid4())
+        return get_buffer_string(messages[:cutoff]), messages[cutoff:]
 
-    def _apply(
-        self, request: ModelRequest, summary: str, n_summarized: int
-    ) -> ModelRequest:
-        summary_message = SystemMessage(content=_SUMMARY_PREFIX + summary)
-        kept = request.messages[n_summarized:]
-        return request.override(messages=[summary_message, *kept])
+    @staticmethod
+    def _update(summary: str, kept: list[AnyMessage]) -> dict[str, Any]:
+        summary_message = HumanMessage(
+            content=_SUMMARY_PREFIX + summary,
+            additional_kwargs={"lc_source": "summarization"},
+        )
+        return {
+            "messages": [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                summary_message,
+                *kept,
+            ]
+        }
 
-    def wrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], ModelResponse],
-    ) -> ModelResponse:
-        """Summarize older history before the model call, if triggered."""
-        if not self._should_summarize(request.messages):
-            return handler(request)
-        split = self._split(request.messages)
-        if split is None:
-            return handler(request)
-        to_summarize, _ = split
+    def before_model(
+        self, state: AgentState[Any], runtime: Runtime[Any]
+    ) -> dict[str, Any] | None:
+        """Replace older history in state with a ScaleDown summary, if triggered."""
+        prepared = self._prepare(state)
+        if prepared is None:
+            return None
+        transcript, kept = prepared
         try:
             summary = self.client.summarize(
-                get_buffer_string(to_summarize),
-                instructions=self.instructions,
-                max_tokens=self.max_tokens,
+                transcript, instructions=self.instructions, max_tokens=self.max_tokens
             )
         except ScaledownAPIError:
             logger.warning(
-                "ScaleDown summarization failed; passing request through.",
-                exc_info=True,
+                "ScaleDown summarization failed; keeping full history.", exc_info=True
             )
-            return handler(request)
-        return handler(self._apply(request, summary, len(to_summarize)))
+            return None
+        return self._update(summary, kept)
 
-    async def awrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-    ) -> ModelResponse:
-        """Async version of `wrap_model_call`."""
-        if not self._should_summarize(request.messages):
-            return await handler(request)
-        split = self._split(request.messages)
-        if split is None:
-            return await handler(request)
-        to_summarize, _ = split
+    async def abefore_model(
+        self, state: AgentState[Any], runtime: Runtime[Any]
+    ) -> dict[str, Any] | None:
+        """Async version of `before_model`."""
+        prepared = self._prepare(state)
+        if prepared is None:
+            return None
+        transcript, kept = prepared
         try:
             summary = await asyncio.to_thread(
                 self.client.summarize,
-                get_buffer_string(to_summarize),
+                transcript,
                 instructions=self.instructions,
                 max_tokens=self.max_tokens,
             )
         except ScaledownAPIError:
             logger.warning(
-                "ScaleDown summarization failed; passing request through.",
-                exc_info=True,
+                "ScaleDown summarization failed; keeping full history.", exc_info=True
             )
-            return await handler(request)
-        return await handler(self._apply(request, summary, len(to_summarize)))
+            return None
+        return self._update(summary, kept)
 
 
 def default_context_extractor(request: ModelRequest) -> tuple[str, str] | None:
@@ -377,9 +419,7 @@ def _format_value(value: Any) -> str:
     return encoded.replace("<", "\\u003c").replace(">", "\\u003e")
 
 
-class ScaledownExtractionMiddleware(
-    AgentMiddleware[ScaledownExtractionState, Any, Any]
-):
+class ScaledownExtractionMiddleware(AgentMiddleware):
     """Pull structured fields out of the conversation with ScaleDown's `/extract`.
 
     Once per agent invocation, before the first model call, the user's messages
@@ -515,7 +555,7 @@ class ScaledownExtractionMiddleware(
         return {"fields": fields, "entities": entities}
 
     def before_agent(
-        self, state: ScaledownExtractionState, runtime: Runtime[Any]
+        self, state: AgentState[Any], runtime: Runtime[Any]
     ) -> dict[str, Any] | None:
         """Extract fields from the conversation and store them in state."""
         text = self.text_builder(state["messages"])
@@ -529,7 +569,7 @@ class ScaledownExtractionMiddleware(
         return {EXTRACTION_STATE_KEY: self._to_record(response)}
 
     async def abefore_agent(
-        self, state: ScaledownExtractionState, runtime: Runtime[Any]
+        self, state: AgentState[Any], runtime: Runtime[Any]
     ) -> dict[str, Any] | None:
         """Async version of `before_agent`."""
         text = self.text_builder(state["messages"])
