@@ -1,3 +1,5 @@
+# mypy: ignore-errors
+# (Throwaway dev script, not shipped in the package; typed loosely on purpose.)
 """Smoke test: run ScaleDown middleware inside a real `create_agent()` agent.
 
 Not part of the test suite. Uses FakeListChatModel and mocks the ScaleDown
@@ -49,37 +51,49 @@ class Spy(AgentMiddleware):
 def run_summarization(use_async: bool) -> None:
     spy = Spy()
     agent = create_agent(
-        model=FakeListChatModel(responses=["final answer"]),
+        model=FakeListChatModel(responses=["final answer", "follow-up answer"]),
         middleware=[
             ScaledownSummarizationMiddleware(
-                trigger=("messages", 5), keep=("messages", 2)
+                trigger=("messages", 6), keep=("messages", 2)
             ),
             spy,
         ],
+        checkpointer=InMemorySaver(),
     )
+    config = {"configurable": {"thread_id": "s1"}}
     history = []
     for i in range(3):
         history += [HumanMessage(f"question {i}"), AIMessage(f"answer {i}")]
     history.append(HumanMessage("latest question"))
 
+    def run(inputs):
+        if use_async:
+            return asyncio.run(agent.ainvoke(inputs, config))
+        return agent.invoke(inputs, config)
+
     with patch.object(
         ScaledownClient, "summarize", return_value="MOCK SUMMARY"
     ) as summarize:
-        inputs = {"messages": history}
-        result = (
-            asyncio.run(agent.ainvoke(inputs)) if use_async else agent.invoke(inputs)
-        )
+        first = run({"messages": history})
+        sent = spy.seen[-1].messages
+        second = run({"messages": [HumanMessage("one more question")]})
 
-    sent = spy.seen[-1].messages
     print(f"[summarization {'async' if use_async else 'sync'}]")
-    print(f"  sd_summarize called: {summarize.call_count}x")
-    print(f"  model saw {len(sent)} messages (state had {len(history)}):")
+    print(f"  sd_summarize called: {summarize.call_count}x across 2 turns")
+    print(f"  model saw {len(sent)} messages (input had {len(history)}):")
     for m in sent:
         print(f"    {type(m).__name__}: {m.text[:60]!r}")
-    print(f"  final reply: {result['messages'][-1].text!r}")
+    print(
+        f"  state after turn 1: {len(first['messages'])} messages; "
+        f"after turn 2: {len(second['messages'])}"
+    )
+    print(f"  final reply: {second['messages'][-1].text!r}")
+    # Summarized once and persisted: turn 2 builds on the summary, no new call.
     assert summarize.call_count == 1
     assert len(sent) == 3 and "MOCK SUMMARY" in sent[0].text
-    assert result["messages"][-1].text == "final answer"
+    assert len(first["messages"]) == 4
+    assert "MOCK SUMMARY" in second["messages"][0].text
+    assert second["messages"][-1].text == "follow-up answer"
 
 
 def run_compression(use_async: bool) -> None:
