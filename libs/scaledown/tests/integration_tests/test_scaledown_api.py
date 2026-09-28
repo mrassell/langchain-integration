@@ -5,10 +5,16 @@ Require `SCALEDOWN_API_KEY`. Run with `make integration_tests`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    ModelRequest,
+    ModelResponse,
+    wrap_model_call,
+)
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import HumanMessage
 
@@ -64,9 +70,10 @@ def test_extract(client: ScaledownClient) -> None:
 
 def test_compress(client: ScaledownClient) -> None:
     response = client.compress(DOCS, "How long is the refund window?")
-    assert response["successful"] is True
-    assert isinstance(response["compressed_prompt"], str)
-    assert len(response["compressed_prompt"]) < len(DOCS)
+    assert response["successful"] is True, response
+    compressed = response.get("compressed_prompt")
+    assert isinstance(compressed, str), f"no compressed_prompt in {response!r}"
+    assert len(compressed) < len(DOCS)
 
 
 def test_summarize(client: ScaledownClient) -> None:
@@ -88,15 +95,28 @@ def test_extraction_middleware_in_agent() -> None:
 
 
 def test_compression_middleware_in_agent() -> None:
+    seen: list[ModelRequest] = []
+
+    @wrap_model_call
+    def spy(
+        request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]
+    ) -> ModelResponse:
+        seen.append(request)
+        return handler(request)
+
     agent = create_agent(
         model=FakeListChatModel(responses=["30 days."]),
         system_prompt=DOCS,
-        middleware=[ScaledownCompressionMiddleware(min_context_chars=500)],
+        middleware=[ScaledownCompressionMiddleware(min_context_chars=500), spy],
     )
     result = agent.invoke(
         {"messages": [HumanMessage("How long is the refund window?")]}
     )
     assert result["messages"][-1].text == "30 days."
+    # The model must have received the compressed context, not the original.
+    system = seen[0].system_message
+    assert system is not None
+    assert len(system.text) < len(DOCS)
 
 
 def test_summarization_middleware_in_agent() -> None:

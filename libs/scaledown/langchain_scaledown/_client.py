@@ -122,6 +122,15 @@ class ScaledownClient:
 
         Returns the full response dict. Callers must check
         `response["successful"]` before trusting `response["compressed_prompt"]`.
+
+        The live API returns the compressed text and token counts nested under
+        `results` (the published docs show them at the top level). Nested
+        fields are copied to the top level, so both shapes read the same way.
         """
         body = {"context": context, "prompt": prompt, "scaledown": {"rate": rate}}
-        return self._post("/compress/raw/", body)
+        data = self._post("/compress/raw/", body)
+        results = data.get("results")
+        if isinstance(results, dict):
+            for key, value in results.items():
+                data.setdefault(key, value)
+        return data
