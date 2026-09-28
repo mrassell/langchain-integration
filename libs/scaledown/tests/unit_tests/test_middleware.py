@@ -691,6 +691,24 @@ class TestClient:
             "threshold": 0.2,
         }
 
+    def test_compress_reads_nested_results(self, client: ScaledownClient) -> None:
+        # The live API nests the output under "results".
+        live = {
+            "successful": True,
+            "results": {"compressed_prompt": "short", "compressed_prompt_tokens": 3},
+        }
+        with patch("langchain_scaledown._client.requests.post") as post:
+            post.return_value.json.return_value = live
+            response = client.compress("ctx", "prompt")
+        assert response["compressed_prompt"] == "short"
+        assert response["compressed_prompt_tokens"] == 3
+
+    def test_compress_top_level_wins(self, client: ScaledownClient) -> None:
+        body = {"compressed_prompt": "top", "results": {"compressed_prompt": "nested"}}
+        with patch("langchain_scaledown._client.requests.post") as post:
+            post.return_value.json.return_value = body
+            assert client.compress("ctx", "prompt")["compressed_prompt"] == "top"
+
     def test_request_failure_wrapped(self, client: ScaledownClient) -> None:
         import requests
 
