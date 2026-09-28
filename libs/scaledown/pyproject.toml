@@ -18,8 +18,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Source Code" = "https://github.com/mrassell/langchain-integration/tree/main/libs/scaledown"
-repository = "https://github.com/mrassell/langchain-integration"
+"Source Code" = "https://github.com/scaledown-team/langchain-integration/tree/main/libs/scaledown"
+repository = "https://github.com/scaledown-team/langchain-integration"
 
 [dependency-groups]
 test = [

@@ -38,7 +38,7 @@ pip install -U langchain-scaledown
 Until the first PyPI release, install from GitHub:
 
 ```bash
-pip install "git+https://github.com/mrassell/langchain-integration#subdirectory=libs/scaledown"
+pip install "git+https://github.com/scaledown-team/langchain-integration#subdirectory=libs/scaledown"
 ```
 
 Set your API key:
@@ -235,7 +235,7 @@ was found. `entities` holds ScaleDown's raw matches with confidence scores.
 ## Development
 
 ```bash
-git clone https://github.com/mrassell/langchain-integration
+git clone https://github.com/scaledown-team/langchain-integration
 cd langchain-integration/libs/scaledown
 uv sync --all-groups
 make test                                        # unit tests (no network)
