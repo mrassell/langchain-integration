@@ -1,12 +1,33 @@
-# langchain-scaledown
+# LangChain Middleware by ScaleDown
 
-ScaleDown middleware for LangChain agents. `langchain-scaledown` plugs
-[ScaleDown](https://scaledown.ai)'s task-specific models into
-`langchain.agents.create_agent()` as agent middleware: one class summarizes long
-conversation history, one compresses large retrieved context relative to the
-user's question, and one extracts structured fields (like a support ticket)
-from the conversation as it happens. All three fail open: if ScaleDown is
-unavailable, the agent runs as if the middleware weren't there.
+`langchain-scaledown` adds [ScaleDown](https://scaledown.ai) small language models (SLMs)
+to any LangChain agent as middleware. Add one line to `middleware=[...]` and your
+agent summarizes long chats, compresses retrieved documents, or turns conversations into
+structured records with purpose-built SLMs, instead of spending frontier-model tokens.
+
+**Privacy:** this package runs inside your application. It has no telemetry and sends
+nothing anywhere except ScaleDown's API endpoints, and only when your agent runs, using
+the `SCALEDOWN_API_KEY` you provide. Each middleware sends only the text it needs (see
+[What gets sent](#what-gets-sent)).
+
+## What it does
+
+- **Summarizes**: `ScaledownSummarizationMiddleware` replaces older chat history with a
+  ScaleDown summary once a conversation gets long. It's a drop-in for LangChain's built-in
+  `SummarizationMiddleware`, with no second LLM call to pay for.
+  - `sd_summarize`: replaces frontier LLM summarization calls (~90% cheaper)
+- **Compresses**: `ScaledownCompressionMiddleware` shrinks large retrieved context before
+  each model call, relative to the user's question. LangChain has no built-in equivalent.
+  - `sd_compress`: reduces context tokens 50–70% before your LLM call (for RAG, long docs)
+- **Extracts**: `ScaledownExtractionMiddleware` turns a conversation into a structured
+  record as it happens, such as a support ticket with the order number, error message,
+  sentiment and issue type.
+  - `sd_extract`: replaces frontier LLM entity extraction calls (~95% cheaper)
+  - `sd_classify`: used automatically for label fields like sentiment and issue type
+
+All three **fail open**. If ScaleDown is unreachable, out of credits, or rejects a
+request, the agent keeps running as if the middleware weren't there, and a warning is
+logged.
 
 ## Installation
 
@@ -14,136 +35,128 @@ unavailable, the agent runs as if the middleware weren't there.
 pip install -U langchain-scaledown
 ```
 
-Set your API key (get one at <https://scaledown.ai/dashboard>):
+Until the first PyPI release, install from GitHub:
+
+```bash
+pip install "git+https://github.com/mrassell/langchain-integration#subdirectory=libs/scaledown"
+```
+
+Set your API key:
 
 ```bash
 export SCALEDOWN_API_KEY="your-api-key"
-# optional, defaults to https://api.scaledown.xyz
-export SCALEDOWN_BASE_URL="https://api.scaledown.xyz"
 ```
 
-Requires Python 3.10+ and `langchain` 1.3+. The middleware works with
-`create_agent()` and with [Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview)
-(`create_deep_agent(middleware=[...])`).
+Requires Python 3.10+ and `langchain` 1.3+.
 
-## `ScaledownSummarizationMiddleware`
-
-A drop-in alternative to LangChain's built-in
-[`SummarizationMiddleware`](https://docs.langchain.com/oss/python/langchain/middleware/built-in#summarization):
-same `trigger` / `keep` options, same behavior, but the summary comes from
-ScaleDown instead of a second LLM call, so there's no summarization model to
-configure or pay for.
-
-Once the conversation crosses `trigger`, every message except the most recent
-ones selected by `keep` is summarized by ScaleDown and replaced in the agent's
-state by a single summary message. Each stretch of history is summarized once,
-and the conversation continues from the summary. Kept messages are untouched,
-and tool results are never separated from the call that requested them.
-
-> **Note:** `sd_summarize` is in private preview. Contact ScaleDown to enable it
-> on your account.
+## Quickstart
 
 ```python
 from langchain.agents import create_agent
-from langchain_scaledown import ScaledownSummarizationMiddleware
+from langchain_scaledown import (
+    ScaledownExtractionMiddleware,
+    ScaledownSummarizationMiddleware,
+)
 
 agent = create_agent(
     "openai:gpt-4.1",
     tools=[...],
     middleware=[
-        ScaledownSummarizationMiddleware(
-            trigger=("tokens", 4000),   # or ("messages", 50), or a list of both
-            keep=("messages", 20),      # or ("tokens", 2000)
-        )
+        ScaledownSummarizationMiddleware(trigger=("tokens", 4000), keep=("messages", 20)),
+        ScaledownExtractionMiddleware({
+            "order_id": "Order number the customer mentions",
+            "sentiment": {"labels": ["frustrated", "neutral", "satisfied"]},
+        }),
     ],
+)
+
+result = agent.invoke({"messages": [{"role": "user", "content": "Order A-1042 failed again!"}]})
+result["scaledown_extraction"]["fields"]
+# {"order_id": "A-1042", "sentiment": "frustrated"}
+```
+
+## Works with
+
+| Product | How |
+|---|---|
+| LangChain agents | `create_agent(..., middleware=[...])` |
+| Deep Agents | `create_deep_agent(..., middleware=[...])` |
+| Sync and async | `agent.invoke()` and `agent.ainvoke()` |
+| Checkpointers | With a checkpointer, summaries persist and extraction records fill in turn by turn |
+
+## Middleware
+
+| Middleware | ScaleDown SLM | Runs | What it changes |
+|---|---|---|---|
+| `ScaledownSummarizationMiddleware` | `sd_summarize` | Before a model call, once the conversation passes `trigger` | Replaces older messages in agent state with one summary message |
+| `ScaledownCompressionMiddleware` | `sd_compress` | Before each model call, when context is over `min_context_chars` | Replaces the system message sent to the model with a compressed version |
+| `ScaledownExtractionMiddleware` | `sd_extract` + `sd_classify` | Once per agent run, before the first model call | Adds a `scaledown_extraction` record to agent state; optionally shows it to the model |
+
+### Summarization (`sd_summarize`)
+
+A drop-in alternative to LangChain's built-in
+[`SummarizationMiddleware`](https://docs.langchain.com/oss/python/langchain/middleware/built-in#summarization),
+with the same `trigger` / `keep` options. When the conversation crosses `trigger`,
+every message except the most recent ones selected by `keep` is replaced in state by a
+single ScaleDown summary. Each stretch of history is summarized once. Tool results are
+never separated from the call that requested them.
+
+```python
+ScaledownSummarizationMiddleware(
+    trigger=("tokens", 4000),   # or ("messages", 50), or a list: summarize when any is hit
+    keep=("messages", 20),      # or ("tokens", 2000)
+    instructions="Keep order numbers and dates.",  # optional, passed to ScaleDown
 )
 ```
 
-The default token counter is LangChain's character-based
-`count_tokens_approximately`; pass `token_counter=` to use your own. You can also
-pass `instructions=` and `max_tokens=` through to ScaleDown.
+> **Note:** `sd_summarize` is in private preview. Contact ScaleDown to enable it on your key.
 
-Fractional sizes (`("fraction", 0.5)`) aren't supported, because they need a
-summarization model's context window. Use a token count instead.
+### Compression (`sd_compress`)
 
-## `ScaledownCompressionMiddleware`
-
-Query-aware compression of large context. LangChain has no built-in equivalent.
-Before each model call, the system message is compressed relative to the last
-user message, and the model sees the compressed version.
-
-> **Use it for needle-in-a-haystack, RAG-style workloads**: a large block of
-> retrieved documents in the system prompt where the model needs a few relevant
-> facts. **Don't use it for short prompts or creative generation**, where
-> compression can drop instructions, tone, or detail the model needs.
+Before each model call, the system message is compressed relative to the user's latest
+question, and the model sees the compressed version.
 
 ```python
-from langchain.agents import create_agent
-from langchain_scaledown import ScaledownCompressionMiddleware
-
 agent = create_agent(
     "openai:gpt-4.1",
     system_prompt=f"Answer using these documents:\n\n{retrieved_docs}",
     middleware=[ScaledownCompressionMiddleware(min_context_chars=2000)],
 )
-
-agent.invoke({"messages": [{"role": "user", "content": "What is the refund window?"}]})
 ```
 
-Compression is skipped (request passed through unchanged) when the context is
-at most `min_context_chars` long (default 2000), when there's no system message
-or user message, when ScaleDown reports `successful: false`, or when the API call
-fails.
+> **Use it for needle-in-a-haystack, RAG-style workloads**, where a big block of
+> retrieved documents holds a few relevant facts. **Don't use it for short prompts or
+> creative generation**, where compression can drop instructions, tone, or detail.
+>
+> **With Deep Agents**, the system message also holds the harness's own instructions,
+> and compression would condense those too.
 
-> **With Deep Agents:** a deep agent's system message also holds the harness's
-> own instructions (planning, file tools), and compression would condense those
-> too. Use compression there only with care, or keep documents out of the system
-> prompt.
+Pass `context_extractor=` to choose what gets compressed. It's a function
+`(request) -> (context, prompt)` that returns `None` to skip. The compressed context
+always replaces the system message.
 
-To choose what gets compressed, pass a `context_extractor` returning
-`(context, prompt)` or `None` to skip. The compressed context always replaces
-the system message:
+### Extraction (`sd_extract` + `sd_classify`)
 
-```python
-def extract(request):
-    if request.system_message is None:
-        return None
-    return request.system_message.text, request.messages[-1].text
+Turns a conversation into a structured record. One schema holds two kinds of fields,
+and ScaleDown handles both in a single call:
 
-ScaledownCompressionMiddleware(context_extractor=extract, rate="auto")
-```
+| Field type | Schema | Value | Good for |
+|---|---|---|---|
+| Extractive | A description string | Copied verbatim from what the user said | Order numbers, error messages, emails, names |
+| Classification | An object with `labels` | One of your labels, via `sd_classify` | Sentiment, issue type, priority |
 
-## `ScaledownExtractionMiddleware`
-
-Turns a conversation into a structured record as it happens. Once per agent
-invocation, before the model runs, the user's messages are sent to ScaleDown's
-`/extract` endpoint with your schema. The result lands in agent state, so your
-tools can read it mid-run and you get it back from `agent.invoke()`.
-
-Two kinds of fields go in one schema, and ScaleDown handles both in a single call:
-
-- **Extractive fields** (a description string): the value is copied verbatim
-  from what the user said, such as an order number, an error message, or an email.
-- **Classification keys** (an object with `labels`): ScaleDown routes these to
-  its classification model, which picks one of your labels. Use them for
-  decisions such as sentiment or issue type, where there's nothing to copy.
-
-By default only the user's messages are extracted from, never the agent's own
-replies, so every extractive value is something the customer actually said.
+Only the **user's** messages are extracted from, never the agent's own replies, so every
+extractive value is something the customer actually said.
 
 ```python
-from langchain.agents import create_agent
 from langchain.tools import ToolRuntime, tool
-from langchain_scaledown import ScaledownExtractionMiddleware
 
 ticket = ScaledownExtractionMiddleware(
     entities={
-        # Extractive: quoted from the customer's messages
         "order_id": "Order number the customer mentions",
         "error_message": "Exact error message or code the customer saw",
         "steps_tried": "What the customer says they already tried",
         "customer_email": "Customer's email address",
-        # Classification keys: routed to ScaleDown's classify model
         "issue_type": {
             "labels": [
                 {"name": "billing", "rubric": "Is this about a charge, refund, or payment?"},
@@ -153,54 +166,84 @@ ticket = ScaledownExtractionMiddleware(
         },
         "sentiment": {"labels": ["frustrated", "neutral", "satisfied"]},
     },
-    context_chars=0,          # skip evidence context to keep state small
-    inject_into_prompt=True,  # let the agent see the fields (see note below)
+    context_chars=0,  # skip evidence snippets to keep state small
 )
 
 
 @tool
 def file_ticket(runtime: ToolRuntime) -> str:
     """File a support ticket with the details gathered so far."""
-    # .get(): the key is absent if extraction hasn't succeeded yet
     fields = runtime.state.get("scaledown_extraction", {}).get("fields", {})
     return crm.create_ticket(**fields)  # your ticketing system
 
 
 agent = create_agent("openai:gpt-4.1", tools=[file_ticket], middleware=[ticket])
-
-result = agent.invoke({"messages": [{"role": "user", "content": "Order A-1042 failed ..."}]})
-result["scaledown_extraction"]["fields"]
-# {"order_id": "A-1042", "error_message": "ERR_PAYMENT_DECLINED", "steps_tried": None,
-#  "customer_email": None, "issue_type": "billing", "sentiment": "frustrated"}
 ```
 
-`fields` has one entry per key in your schema: the highest-confidence value, or
-`None` if nothing was found. `entities` holds ScaleDown's raw matches with
-confidence scores. Nested and array schemas work too; their values come from
-ScaleDown's `structured_result`.
+With a checkpointer, extraction re-runs every turn over the whole conversation, so the
+record fills in as the customer adds detail.
 
-With a checkpointer, extraction re-runs every turn over the whole conversation,
-so the record fills in as the customer adds detail (turn 1 has the order number;
-turn 2 adds their email).
+> **`inject_into_prompt=True`** (off by default) also shows the fields to the model, for
+> example so it can escalate a frustrated customer. Extractive values are customer text,
+> so this puts customer text into the system prompt. Have the agent branch on
+> classification fields, whose values can only be one of your labels.
 
-> **About `inject_into_prompt`** (off by default): it appends the extracted fields
-> to the system message so the agent can act on them, for example escalating a
-> frustrated customer. Extractive values are customer text, so enabling this puts
-> customer text into the system prompt. Only turn it on when that's acceptable,
-> and have the agent branch on classification keys, whose values can only be
-> one of your labels.
+## Example output
 
-Pass `text_builder=` to extract from something other than the user's messages.
+After `agent.invoke(...)`, the extraction record is in the result:
+
+```python
+result["scaledown_extraction"]
+```
+
+```json
+{
+  "fields": {
+    "order_id": "A-1042",
+    "error_message": "ERR_PAYMENT_DECLINED",
+    "steps_tried": null,
+    "customer_email": "jane@example.com",
+    "issue_type": "billing",
+    "sentiment": "frustrated"
+  },
+  "entities": [
+    {"text": "A-1042", "type": "order_id", "confidence": 0.97, "start": 6, "end": 12},
+    {"text": "billing", "type": "issue_type", "confidence": 0.93, "start": 0, "end": 0}
+  ]
+}
+```
+
+`fields` has one entry per schema key: the highest-confidence value, or `null` if nothing
+was found. `entities` holds ScaleDown's raw matches with confidence scores.
+
+## What gets sent
+
+| Middleware | Sent to ScaleDown | Endpoint |
+|---|---|---|
+| Summarization | The older messages being summarized | `/summarization/abstractive` |
+| Compression | The system message and the latest user message | `/compress/raw/` |
+| Extraction | The user's messages (not the agent's replies) and your schema | `/extract` |
+
+## Configuration
+
+| Setting | Where | Default |
+|---|---|---|
+| API key | `SCALEDOWN_API_KEY` env var, or `api_key=` | Required |
+| API base URL | `SCALEDOWN_BASE_URL` env var, or `base_url=` | `https://api.scaledown.xyz` |
+| Shared client | `client=ScaledownClient(...)` on any middleware | One client per middleware |
 
 ## Development
 
-The package lives in `libs/scaledown` and uses [uv](https://docs.astral.sh/uv/):
-
 ```bash
-cd libs/scaledown
+git clone https://github.com/mrassell/langchain-integration
+cd langchain-integration/libs/scaledown
 uv sync --all-groups
-make test                                 # unit tests (no network)
-make lint                                 # ruff + mypy
-SCALEDOWN_API_KEY=... make integration_tests   # tests against the live ScaleDown API
-uv run python scripts/smoke_test.py       # runs every middleware in a real agent (mocked API)
+make test                                        # unit tests (no network)
+make lint                                        # ruff + mypy
+SCALEDOWN_API_KEY=... make integration_tests     # tests against the live ScaleDown API
+uv run python scripts/smoke_test.py              # every middleware in a real agent (mocked API)
 ```
+
+## Get a ScaleDown API key
+
+Sign up at [scaledown.ai/dashboard](https://scaledown.ai/dashboard) — 50 million free tokens included.
