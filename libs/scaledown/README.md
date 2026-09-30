@@ -266,9 +266,30 @@ say -o voicemail.aiff "Hi, this is Marco calling about order B 2207. The app cra
 every time I open my cart, it says sync timeout. I already reinstalled it twice. \
 Honestly this is really frustrating. My email is marco at example dot com. Thanks."
 
-pip install faster-whisper
+pip install faster-whisper "av<19"  # PyAV 19 dropped an option faster-whisper uses
 python examples/support_triage.py --audio voicemail.aiff
 ```
+
+Output from a real run:
+
+```text
+Transcript: Hi, this is Marco calling about Order B2207. The app crashes every time I
+open my cart that says sync timeout. I already reinstalled it twice. Honestly this is
+really frustrating. My email is Marco at example.com. Thanks.
+
+ScaleDown extracted:
+    order_id: B2207
+    error_message: sync timeout
+    steps_tried: reinstalled it twice
+    customer_email: Marco at example.com
+    issue_type: technical
+    sentiment: frustrated
+
+Ticket filed: T-1001 -> Tech Support (high priority): ...
+```
+
+Whisper writes the email as it was spoken, and extraction copies it as is rather than
+guessing an address. The agent's callback note asks the team to confirm it.
 
 ## What gets sent
 

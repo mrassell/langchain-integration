@@ -14,7 +14,7 @@ Any LangChain chat model works, e.g. `--model openai:gpt-4.1`
 
 Voicemail mode transcribes a recording locally with Whisper, then files it:
 
-    pip install faster-whisper
+    pip install faster-whisper "av<19"  # PyAV 19 dropped an option it uses
     python examples/support_triage.py --audio voicemail.aiff
 """
 
@@ -225,7 +225,7 @@ def transcribe(path: str) -> str:
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError:
-        sys.exit("Setup error: voicemail mode needs `pip install faster-whisper`")
+        sys.exit("Setup error: voicemail needs `pip install faster-whisper 'av<19'`")
     model = WhisperModel("base.en", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(path)
     return " ".join(segment.text.strip() for segment in segments)
