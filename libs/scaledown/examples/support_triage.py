@@ -155,7 +155,41 @@ def cell(value: Any, width: int) -> str:
 
 
 def run_batch(agent: Any) -> None:
-    print("=== Part 1: batch triage ===\n")
+    print("=== Part 1: batch triage ===")
+    rows = []
+    for i, message in enumerate(BATCH, 1):
+        print(f"\n--- Ticket {i} of {len(BATCH)} ---")
+        print(f"Customer: {message}")
+        filed_before = len(TICKETS)
+        result = agent.invoke(
+            {"messages": [HumanMessage(message)]},
+            {"configurable": {"thread_id": f"batch-{i}"}},
+        )
+        fields = fields_of(result)
+        print("ScaleDown extracted:")
+        for key, value in fields.items():
+            if value not in (None, ""):
+                print(f"    {key}: {value}")
+        if len(TICKETS) > filed_before:
+            ticket = TICKETS[-1]
+            team, priority = ticket["team"], ticket["priority"]
+            print(f"-> {ticket['id']} filed with {team} ({priority} priority)")
+        else:
+            team, priority = "(not filed)", ""
+            print("-> not filed")
+        rows.append(
+            [
+                i,
+                fields.get("order_id"),
+                fields.get("error_message"),
+                fields.get("issue_type"),
+                fields.get("sentiment"),
+                team,
+                priority,
+            ]
+        )
+
+    print("\n=== Summary ===\n")
     cols = [
         ("#", 3),
         ("order_id", 9),
@@ -167,26 +201,7 @@ def run_batch(agent: Any) -> None:
     ]
     print("  ".join(cell(name, w) for name, w in cols))
     print("  ".join("-" * w for _, w in cols))
-    for i, message in enumerate(BATCH, 1):
-        filed_before = len(TICKETS)
-        result = agent.invoke(
-            {"messages": [HumanMessage(message)]},
-            {"configurable": {"thread_id": f"batch-{i}"}},
-        )
-        fields = fields_of(result)
-        if len(TICKETS) > filed_before:
-            team, priority = TICKETS[-1]["team"], TICKETS[-1]["priority"]
-        else:
-            team, priority = "(not filed)", ""
-        row = [
-            i,
-            fields.get("order_id"),
-            fields.get("error_message"),
-            fields.get("issue_type"),
-            fields.get("sentiment"),
-            team,
-            priority,
-        ]
+    for row in rows:
         print("  ".join(cell(v, w) for v, (_, w) in zip(row, cols)))
     print()
 
