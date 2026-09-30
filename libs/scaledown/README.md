@@ -216,6 +216,34 @@ result["scaledown_extraction"]
 `fields` has one entry per schema key: the highest-confidence value, or `null` if nothing
 was found. `entities` holds ScaleDown's raw matches with confidence scores.
 
+## Example: support triage
+
+[`examples/support_triage.py`](examples/support_triage.py) runs a support agent end to
+end. ScaleDown fills in each ticket from the customer's messages, and a `file_ticket`
+tool routes it by issue type and escalates frustrated customers. The LLM never retypes
+the order number or email.
+
+```bash
+pip install langchain-scaledown langchain-anthropic
+export SCALEDOWN_API_KEY=...  ANTHROPIC_API_KEY=...
+python examples/support_triage.py                         # or --model openai:gpt-4.1
+```
+
+It triages a batch of tickets into a table, then shows one conversation where the
+record fills in turn by turn (`+` marks a newly extracted field):
+
+```text
+--- Turn 2 ---
+Customer: It's jane@example.com
+ScaleDown extracted:
+    order_id: A-1042
+    error_message: ERR_PAYMENT_DECLINED
+  + customer_email: jane@example.com
+    issue_type: billing
+    sentiment: frustrated
+Ticket filed: T-1006 -> Billing (high priority): ...
+```
+
 ## What gets sent
 
 | Middleware | Sent to ScaleDown | Endpoint |
