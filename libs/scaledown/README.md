@@ -230,18 +230,44 @@ python examples/support_triage.py                         # or --model openai:gp
 ```
 
 It triages a batch of tickets into a table, then shows one conversation where the
-record fills in turn by turn (`+` marks a newly extracted field):
+record fills in turn by turn (`+` marks a newly extracted field). Output from a real run:
 
 ```text
+#    order_id   error_message       issue_type  sentiment   team            priority
+---  ---------  ------------------  ----------  ----------  --------------  --------
+1    A-1042     -                   billing     neutral     Billing         normal
+2    B-2207     ERR_SYNC_TIMEOUT    technical   frustrated  Tech Support    high
+3    C-3310     INVALID_2FA_CODE    account     frustrated  Accounts        high
+...
+
 --- Turn 2 ---
 Customer: It's jane@example.com
 ScaleDown extracted:
     order_id: A-1042
     error_message: ERR_PAYMENT_DECLINED
+    steps_tried: tried two different cards
   + customer_email: jane@example.com
     issue_type: billing
     sentiment: frustrated
-Ticket filed: T-1006 -> Billing (high priority): ...
+Ticket filed: T-1006 -> Billing (high priority): Customer Jane (jane@example.com)
+experiencing repeated ERR_PAYMENT_DECLINED on order A-1042 despite trying two
+different cards; frustrated after third contact.
+```
+
+### From a voicemail
+
+`--audio` transcribes a recording locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+(no API key; the model downloads on first run), then files the transcript as a ticket
+with the same extraction. On a Mac you can make a sample voicemail with the built-in
+`say` voice:
+
+```bash
+say -o voicemail.aiff "Hi, this is Marco calling about order B 2207. The app crashes \
+every time I open my cart, it says sync timeout. I already reinstalled it twice. \
+Honestly this is really frustrating. My email is marco at example dot com. Thanks."
+
+pip install faster-whisper
+python examples/support_triage.py --audio voicemail.aiff
 ```
 
 ## What gets sent

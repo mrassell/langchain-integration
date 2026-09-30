@@ -11,12 +11,18 @@ said, never retyped by the LLM.
 
 Any LangChain chat model works, e.g. `--model openai:gpt-4.1`
 (with `pip install langchain-openai` and OPENAI_API_KEY).
+
+Voicemail mode transcribes a recording locally with Whisper, then files it:
+
+    pip install faster-whisper
+    python examples/support_triage.py --audio voicemail.aiff
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
@@ -26,7 +32,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from langchain_scaledown import ScaledownExtractionMiddleware
+from langchain_scaledown import (
+    ScaledownAPIError,
+    ScaledownClient,
+    ScaledownExtractionMiddleware,
+)
 
 TICKET_SCHEMA: dict[str, Any] = {
     "order_id": "Order number the customer mentions",
@@ -67,7 +77,14 @@ SYSTEM_PROMPT = """You are a customer support agent for an online store.
 To file a ticket you need the customer's order number and email address.
 If either is missing from the extracted fields, ask the customer for it.
 Once you have both, call file_ticket with a one-sentence summary, then tell the
-customer their ticket number and which team has it. Keep replies short."""
+customer their ticket number and which team has it. Keep replies short.
+Reply in plain text, no Markdown."""
+
+VOICEMAIL_PROMPT = """You are a customer support agent for an online store.
+The message is a transcribed voicemail, so the customer can't answer questions.
+Call file_ticket with a one-sentence summary, noting anything missing (order
+number, email). Then write a short callback note for the team.
+Reply in plain text, no Markdown."""
 
 TICKETS: list[dict[str, Any]] = []
 
@@ -95,11 +112,11 @@ def file_ticket(summary: str, runtime: ToolRuntime) -> str:
     return f"Filed {ticket['id']} with {team} ({priority} priority)."
 
 
-def build_agent(model: BaseChatModel | str) -> Any:
+def build_agent(model: BaseChatModel | str, system_prompt: str = SYSTEM_PROMPT) -> Any:
     return create_agent(
         model=model,
         tools=[file_ticket],
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         middleware=[
             ScaledownExtractionMiddleware(
                 TICKET_SCHEMA, context_chars=0, inject_into_prompt=True
@@ -116,8 +133,8 @@ BATCH = [
     "reinstalled it twice. This is ridiculous. Order B-2207, marco@example.com",
     "I can't log in, it keeps saying INVALID_2FA_CODE even though I just reset "
     "my password. Order C-3310, sam.lee@example.com",
-    "Package for order D-4481 says delivered but it's not here. "
-    "ana.r@example.com. Thanks for checking!",
+    "Package for order D-4481 says delivered but I can't find it. No stress, "
+    "probably a neighbor grabbed it. Thanks so much for checking! ana.r@example.com",
     "Is order E-5092 shipping this week? Just planning ahead. jo@example.com",
 ]
 
@@ -192,12 +209,58 @@ def run_chat(agent: Any) -> None:
         if isinstance(reply, AIMessage):
             print(f"Agent: {reply.text}")
         for ticket in TICKETS[filed_before:]:
-            print(
-                f"Ticket filed: {ticket['id']} -> {ticket['team']} "
-                f"({ticket['priority']} priority): {ticket['summary']}"
-            )
+            print_ticket(ticket)
         previous = fields
     print()
+
+
+def print_ticket(ticket: dict[str, Any]) -> None:
+    print(
+        f"Ticket filed: {ticket['id']} -> {ticket['team']} "
+        f"({ticket['priority']} priority): {ticket['summary']}"
+    )
+
+
+def transcribe(path: str) -> str:
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except ImportError:
+        sys.exit("Setup error: voicemail mode needs `pip install faster-whisper`")
+    model = WhisperModel("base.en", device="cpu", compute_type="int8")
+    segments, _ = model.transcribe(path)
+    return " ".join(segment.text.strip() for segment in segments)
+
+
+def run_voicemail(agent: Any, transcript: str) -> None:
+    print("=== Voicemail -> ticket ===\n")
+    print(f"Transcript: {transcript}\n")
+    filed_before = len(TICKETS)
+    result = agent.invoke(
+        {"messages": [HumanMessage(transcript)]},
+        {"configurable": {"thread_id": "voicemail"}},
+    )
+    print("ScaleDown extracted:")
+    for key, value in fields_of(result).items():
+        print(f"    {key}: {value}")
+    reply = result["messages"][-1]
+    if isinstance(reply, AIMessage):
+        print(f"\nAgent: {reply.text}\n")
+    for ticket in TICKETS[filed_before:]:
+        print_ticket(ticket)
+    print()
+
+
+def check_scaledown() -> None:
+    """Fail fast on a bad key instead of running with extraction silently off."""
+    try:
+        ScaledownClient().extract(
+            "Order A-1042", {"order_id": "Order number"}, context_chars=0
+        )
+    except ScaledownAPIError as e:
+        sys.exit(
+            "ScaleDown rejected SCALEDOWN_API_KEY. New keys can take a few "
+            f"minutes to activate. ({e})"
+        )
 
 
 def main() -> None:
@@ -207,11 +270,23 @@ def main() -> None:
         default="anthropic:claude-sonnet-5",
         help="Any init_chat_model string (default: %(default)s)",
     )
+    parser.add_argument(
+        "--audio",
+        metavar="PATH",
+        help="Transcribe this voicemail and file it as a ticket (needs faster-whisper)",
+    )
     args = parser.parse_args()
+    if args.audio and not Path(args.audio).is_file():
+        sys.exit(f"No such audio file: {args.audio}")
     try:
-        agent = build_agent(init_chat_model(args.model))
+        check_scaledown()
+        model = init_chat_model(args.model)
     except (ImportError, ValueError) as e:
         sys.exit(f"Setup error: {e}")
+    if args.audio:
+        run_voicemail(build_agent(model, VOICEMAIL_PROMPT), transcribe(args.audio))
+        return
+    agent = build_agent(model)
     run_batch(agent)
     run_chat(agent)
 
